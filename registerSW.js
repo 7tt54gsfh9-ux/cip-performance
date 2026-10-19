@@ -1,0 +1,1 @@
+if('serviceWorker' in navigator) {window.addEventListener('load', () => {navigator.serviceWorker.register('/cip-performance/sw.js', { scope: '/cip-performance/' })})}
