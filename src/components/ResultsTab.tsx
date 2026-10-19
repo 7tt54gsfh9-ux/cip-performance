@@ -1,4 +1,4 @@
-import type { RunConfig, RunResult, ThrowResult } from '../lib/calc';
+import type { EndResult, PartResult, RunConfig, RunResult, ThrowResult } from '../lib/calc';
 import { fmt } from '../lib/format';
 import { Card, Pill } from './ui';
 
@@ -70,8 +70,8 @@ function FlagRow({ level, msg }: { level: 'red' | 'amber' | 'info'; msg: string 
 
 export function StageTable({ r, cfg }: { r: RunResult; cfg: RunConfig }) {
   const S = r.stages;
-  const throwsOf = (s: number) => r.throws.filter((t) => t.stage === s);
   const rows: { label: string; cells: (string | { v: string; cls: string })[] }[] = [
+    { label: 'Cylinder(s)', cells: S.map((s) => s.parts.map((p) => `T${p.throwIndex + 1}${posShort(p)} ${p.cylinder.boreIn}"`).join('\n')) },
     { label: 'Suction press, psig', cells: S.map((s) => fmt(s.psPsig, 1)) },
     { label: 'Discharge press, psig', cells: S.map((s) => fmt(s.pdPsig, 1)) },
     { label: 'Compression ratio', cells: S.map((s) => ({ v: fmt(s.ratio, 2), cls: s.ratio > 4.5 ? amber : '' })) },
@@ -84,8 +84,8 @@ export function StageTable({ r, cfg }: { r: RunResult; cfg: RunConfig }) {
     {
       label: 'VE HE / CE, %',
       cells: S.map((s) =>
-        throwsOf(s.stage)
-          .map((t) => `${t.he.active ? fmt(t.he.ve, 1) : '—'} / ${t.ce.active ? fmt(t.ce.ve, 1) : '—'}`)
+        s.parts
+          .map((p) => `${p.he.active ? fmt(p.he.ve, 1) : '—'} / ${p.ce.active ? fmt(p.ce.ve, 1) : '—'}`)
           .join('\n'),
       ),
     },
@@ -132,6 +132,36 @@ export function StageTable({ r, cfg }: { r: RunResult; cfg: RunConfig }) {
   );
 }
 
+const posShort = (p: PartResult) => (p.position === 'inboard' ? ' in' : p.position === 'outboard' ? ' out' : '');
+
+export function endText(e: EndResult): string {
+  if (e.active) return `active · VE ${fmt(e.ve, 1)}%`;
+  if (e.mode === 'vent') return 'vented 0 psig';
+  return `at stg ${e.mode.slice(1)} suction (${fmt(e.refPsig, 0)} psig)`;
+}
+
+function PartRows({ p }: { p: PartResult }) {
+  const pos = p.position === 'single' ? 'Cylinder' : p.position === 'inboard' ? 'Inboard' : 'Outboard';
+  const heName = p.position === 'inboard' ? 'HE (neck side)' : p.position === 'outboard' ? 'HE (outer)' : 'HE';
+  const ceName = p.position === 'outboard' ? 'CE (neck side)' : p.position === 'inboard' ? 'CE (rod side)' : 'CE';
+  return (
+    <div className="mt-2 rounded-lg bg-zinc-50 px-2 py-1.5 text-[12px] text-zinc-700">
+      <div className="flex flex-wrap items-center gap-1.5">
+        <b>
+          {pos}: stage {p.stage} · {p.cylinder.boreIn}" · MAWP {fmt(p.cylinder.mawpPsig)} psig
+        </b>
+        {p.cylinder.placeholder && <Pill level="amber">placeholder</Pill>}
+      </div>
+      <div>
+        {heName}: {fmt(p.he.areaIn2, 3)} in² · clr {fmt(p.he.clearancePct, 1)}% · {endText(p.he)}
+      </div>
+      <div>
+        {ceName}: {fmt(p.ce.areaIn2, 3)} in² · clr {fmt(p.ce.clearancePct, 1)}% · {endText(p.ce)}
+      </div>
+    </div>
+  );
+}
+
 export function ThrowTable({ r, minRev = 15 }: { r: RunResult; minRev?: number }) {
   const lim = (v: number | null) => (v == null ? 'n/a' : fmt(v));
   return (
@@ -140,48 +170,41 @@ export function ThrowTable({ r, minRev = 15 }: { r: RunResult; minRev?: number }
         <div key={t.index} className="rounded-xl border border-zinc-200 p-3 print:break-inside-avoid">
           <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
             <span className="text-sm font-bold">
-              Throw {t.index + 1} · Stage {t.stage} · {t.cylinder.boreIn}" bore
+              Throw {t.index + 1} · {t.kind === 'tandem' ? `Tandem stg ${t.parts.map((p) => p.stage).join(' + ')} · neck ${t.neckDiaIn}" (assumed)` : `Stage ${t.parts[0].stage} · ${t.parts[0].cylinder.boreIn}" bore`}
             </span>
-            {t.cylinder.placeholder && <Pill level="amber">placeholder: verify with CiP data</Pill>}
           </div>
           <table className="w-full text-sm tabular-nums">
             <thead>
               <tr className="text-left text-[11px] uppercase text-zinc-500">
-                <th className="py-1 font-semibold">Gas rod load</th>
+                <th className="py-1 font-semibold">Gas rod load{t.kind === 'tandem' ? ' (all 4 ends)' : ''}</th>
                 <th className="py-1 text-right font-semibold">lb</th>
                 <th className="py-1 text-right font-semibold">Limit</th>
                 <th className="py-1 text-right font-semibold">%</th>
               </tr>
             </thead>
             <tbody>
-              <tr className="border-t border-zinc-100">
-                <td className="py-1">Compression</td>
-                <td className="py-1 text-right">{fmt(t.rod.compressionLb)}</td>
-                <td className="py-1 text-right text-zinc-500">{lim(r.frame.rodLoadCompressionLb)}</td>
-                <td className={'py-1 text-right ' + pctCls(t.pctCompression)}>{fmt(t.pctCompression, 0)}</td>
-              </tr>
-              <tr className="border-t border-zinc-100">
-                <td className="py-1">Tension</td>
-                <td className="py-1 text-right">{fmt(t.rod.tensionLb)}</td>
-                <td className="py-1 text-right text-zinc-500">{lim(r.frame.rodLoadTensionLb)}</td>
-                <td className={'py-1 text-right ' + pctCls(t.pctTension)}>{fmt(t.pctTension, 0)}</td>
-              </tr>
-              <tr className="border-t border-zinc-100">
-                <td className="py-1">Combined</td>
-                <td className="py-1 text-right">{fmt(t.rod.combinedLb)}</td>
-                <td className="py-1 text-right text-zinc-500">{lim(r.frame.rodLoadCombinedLb)}</td>
-                <td className={'py-1 text-right ' + pctCls(t.pctCombined)}>{fmt(t.pctCombined, 0)}</td>
-              </tr>
+              {(
+                [
+                  ['Compression', t.rod.compressionLb, r.frame.rodLoadCompressionLb, t.pctCompression],
+                  ['Tension', t.rod.tensionLb, r.frame.rodLoadTensionLb, t.pctTension],
+                  ['Combined', t.rod.combinedLb, r.frame.rodLoadCombinedLb, t.pctCombined],
+                ] as const
+              ).map(([label, v, l, pc]) => (
+                <tr key={label} className="border-t border-zinc-100">
+                  <td className="py-1">{label}</td>
+                  <td className="py-1 text-right">{fmt(v)}</td>
+                  <td className="py-1 text-right text-zinc-500">{lim(l)}</td>
+                  <td className={'py-1 text-right ' + pctCls(pc)}>{fmt(pc, 0)}</td>
+                </tr>
+              ))}
             </tbody>
           </table>
-          <div className="mt-2 grid grid-cols-2 gap-x-3 gap-y-1 text-[12px] text-zinc-600">
-            <span>Reversal (gas): <b className={t.rod.reversalDeg < minRev ? red : ''}>{t.rod.reversalDeg}°</b></span>
-            <span>MAWP: <b>{fmt(t.cylinder.mawpPsig)} psig</b></span>
-            <span>Clearance HE/CE: {fmt(t.he.clearancePct, 1)}% / {fmt(t.ce.clearancePct, 1)}%</span>
-            <span>VE HE/CE: {t.he.active ? fmt(t.he.ve, 1) : 'off'} / {t.ce.active ? fmt(t.ce.ve, 1) : 'off'}</span>
-            <span>Disp. HE/CE: {fmt(t.he.displacementCfm, 2)} / {fmt(t.ce.displacementCfm, 2)} CFM</span>
-            <span>Area HE/CE: {fmt(t.areas.heIn2, 3)} / {fmt(t.areas.ceIn2, 3)} in²</span>
+          <div className="mt-1 text-[12px] text-zinc-600">
+            Reversal (gas only): <b className={t.rod.reversalDeg < minRev ? red : ''}>{t.rod.reversalDeg}°</b>
           </div>
+          {t.parts.map((p) => (
+            <PartRows key={p.position} p={p} />
+          ))}
         </div>
       ))}
     </div>

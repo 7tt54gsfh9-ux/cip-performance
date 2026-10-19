@@ -12,8 +12,8 @@ Live: https://7tt54gsfh9-ux.github.io/cip-performance/
 
 ## Features
 
-- **Setup**: frame, RPM, 1–2 stages on the 2-throw frames (the code supports up to 3 stages if a
-  frame with more throws is added), cylinder + stage per throw, double/single acting, end deactivation,
+- **Setup**: frame, RPM, 1–3 stages (3 stages unlock when a throw is set to **tandem**), single or tandem per throw, a
+  **PXT 3-stage (tandem)** preset (also `?preset=pxt3`), cylinder + stage per throw, double/single acting, end deactivation,
   head-end variable-volume pocket % open, gas SG/k (presets or auto-k), Z method,
   suction P/T, discharge P, interstage cooler outlet temp (default 120 °F), atmospheric pressure (default
   14.4 psia), optional driver HP, efficiencies, alarms.
@@ -53,6 +53,39 @@ Equal-ratio mode on a multi-stage unit usually won't balance flow. The app repor
 lowest stage flow as unit capacity, sums stage BHP as calculated, and flags the imbalance.
 Use **Balance flow** to see how the running unit actually settles.
 
+## Tandem throws
+
+A throw can carry one cylinder or a tandem: an **inboard** (frame-side) and an **outboard** cylinder on one rod,
+each assigned its own stage. Working areas (`tandemAreas` in `calc.ts`):
+
+| End | Area |
+|---|---|
+| Inboard CE (rod side) | A_in − A_rod |
+| Inboard HE (neck side) | A_in − A_neck |
+| Outboard CE (neck side) | A_out − A_neck |
+| Outboard HE (outer head) | A_out |
+
+The tandem neck dia is editable and **assumed equal to the piston rod (1.125")** unless known.
+
+Each tandem end has a reference: **active** (compressing for its stage), **vented** (0 psig), or **held at
+stage N suction**. Default arrangement (ASSUMPTION, typical small-frame HP tandem):
+
+- outboard (HP) cylinder: head end active; neck-side crank end at 1st-stage suction
+- inboard cylinder: crank end active; neck-side head end at 1st-stage suction
+
+The two active ends compress on opposite strokes, which keeps peak rod load down and gives reversal.
+An end that the cylinder library marks as non-acting (SA) falls back to its own stage suction even if set active.
+Inactive ends on single cylinders sit at their own stage suction, as before.
+
+Rod load for a tandem sums the gas force of all four faces at each crank degree (gauge pressures; HE faces push toward
+the crank, CE faces pull) and checks compression, tension, combined and reversal against the frame limits.
+MAWP is checked against the higher of the stage discharge and any referenced pressure.
+
+Preset **PXT 3-stage (tandem)**: throw 1 = 1st stage 4.5" DA; throw 2 = tandem 2nd-stage 4.5" inboard (CE acting)
++ 3rd-stage 2.75" outboard (HE acting), balanced flow. All placeholder cylinders sized for ~100 → 1,500 psig.
+
+Each interstage has its own cooler-outlet temperature (stage 2 and stage 3 suction temps).
+
 ## Frame data (`src/data/frames.ts`)
 
 From https://ngsgi.com/pdfs/cip_pxt_pht.pdf:
@@ -86,7 +119,8 @@ Clearance should be % of that end's swept volume. If a sheet gives clearance vol
 - Inertia loads and crosshead pin reversal per OEM method (gas-load-only screen)
 - Real CiP clearances, MAWPs, and pocket sizes (placeholders, apart from the 1.75" and 2.0625" bore/MAWP)
 - Gas composition input (SG + k only), and liquids/condensation
-- Fixed clearance pockets/plugs, tandem cylinders, and side-stream stages
+- Fixed clearance pockets/plugs, and side-stream stages
+- Tandem packing/neck leakage and the real CiP tandem end arrangement (defaults assumed)
 
 ## Development
 

@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { frameById } from './data/frames';
 import { SEED_CYLINDERS, type Cylinder } from './data/cylinders';
-import { DEFAULT_CONFIG, runPerformance, type RunConfig } from './lib/calc';
+import { DEFAULT_CONFIG, PRESET_PXT_3STAGE, runPerformance, type RunConfig } from './lib/calc';
 import { downloadText, runToCsv } from './lib/csv';
 import { fmt } from './lib/format';
 import { loadCurrent, loadCustomCylinders, loadRuns, saveCurrent, saveCustomCylinders, saveRuns, type SavedRun } from './lib/storage';
@@ -25,7 +25,15 @@ const TABS: { id: Tab; label: string }[] = [
 export default function App() {
   const [custom, setCustomState] = useState<Cylinder[]>(loadCustomCylinders);
   const cylinders = useMemo(() => [...custom, ...SEED_CYLINDERS], [custom]);
-  const [cfg, setCfgState] = useState<RunConfig>(() => normaliseThrows(loadCurrent(), [...loadCustomCylinders(), ...SEED_CYLINDERS]));
+  const [cfg, setCfgState] = useState<RunConfig>(() => {
+    const all = [...loadCustomCylinders(), ...SEED_CYLINDERS];
+    // ?preset=pxt3 opens the PXT 3-stage tandem preset (shareable link)
+    if (new URLSearchParams(location.search).get('preset') === 'pxt3') {
+      history.replaceState(null, '', location.pathname + location.hash);
+      return normaliseThrows({ ...PRESET_PXT_3STAGE, dischargePsig: 1500 }, all);
+    }
+    return normaliseThrows(loadCurrent(), all);
+  });
   const [runs, setRunsState] = useState<SavedRun[]>(loadRuns);
   const [tab, setTabState] = useState<Tab>(() => {
     const h = location.hash.slice(1) as Tab;
@@ -51,7 +59,7 @@ export default function App() {
   const frame = frameById(cfg.frameId);
   const result = useMemo(() => runPerformance(cfg, frame, lookup), [cfg, frame, lookup]);
   const reds = result.flags.filter((f) => f.level === 'red').length;
-  const inUse = useMemo(() => new Set(cfg.throws.map((t) => t.cylinderId)), [cfg]);
+  const inUse = useMemo(() => new Set(cfg.throws.flatMap((t) => (t.kind === 'tandem' && t.outCylinderId ? [t.cylinderId, t.outCylinderId] : [t.cylinderId]))), [cfg]);
 
   const onCsv = () => {
     const name = runName || `${cfg.frameId}-run`;

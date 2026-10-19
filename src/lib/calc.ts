@@ -228,13 +228,65 @@ export function pistonPosition(thetaDeg: number, strokeIn: number, lRatio = 4): 
   return rc * (1 - Math.cos(t)) + L - Math.sqrt(L * L - rc * rc * Math.sin(t) ** 2);
 }
 
+/** One gas-loaded piston face for the rod-load cycle. */
+export interface CycleEnd {
+  /** 'HE' faces push the rod toward the crank (compression); 'CE' faces pull it (tension). */
+  face: 'HE' | 'CE';
+  areaIn2: number;
+  clearancePct: number;
+  /** true = compressing between ps and pd; false = held at fixedPsia */
+  active: boolean;
+  ps: number;
+  pd: number;
+  fixedPsia: number;
+}
+
 /**
- * Gas rod load over one revolution from an ideal indicator cycle
- * (isentropic re-expansion/compression with clearance, flat suction and
- * discharge at the flange pressures). An inactive end (single-acting or
- * deactivated) sits at suction pressure. Inertia is NOT included, so the
- * reversal figure is a gas-load-only screen.
+ * Gas rod load over one revolution, summing every face on the throw (2 for a
+ * single cylinder, 4 for a tandem). Each active face follows an ideal
+ * indicator cycle (isentropic re-expansion/compression with clearance, flat
+ * suction and discharge at the flange pressures). All pistons ride one rod, so
+ * every 'HE' face is at minimum volume at 0° and every 'CE' face at 180°.
+ * Gauge pressures are used, which nets out the atmospheric load on the rod
+ * where it leaves into the crankcase. Inertia is NOT included.
  */
+export function rodLoadCycleEnds(ends: CycleEnd[], strokeIn: number, k: number, atmPsia: number, stepDeg = 1): RodLoadResult {
+  const S = strokeIn;
+  const pre = ends.map((e) => {
+    const vc = (e.clearancePct / 100) * e.areaIn2 * S;
+    return { ...e, vc, vmax: vc + e.areaIn2 * S };
+  });
+  let maxF = -Infinity;
+  let minF = Infinity;
+  let degC = 0;
+  let degT = 0;
+  for (let th = 0; th < 360; th += stepDeg) {
+    const x = pistonPosition(th, S);
+    let f = 0;
+    for (const e of pre) {
+      let p = e.fixedPsia;
+      if (e.active) {
+        if (e.face === 'HE') {
+          const v = e.vc + e.areaIn2 * x;
+          p = th < 180 ? Math.max(e.ps, e.pd * Math.pow(e.vc / v, k)) : Math.min(e.pd, e.ps * Math.pow(e.vmax / v, k));
+        } else {
+          const v = e.vc + e.areaIn2 * (S - x);
+          p = th < 180 ? Math.min(e.pd, e.ps * Math.pow(e.vmax / v, k)) : Math.max(e.ps, e.pd * Math.pow(e.vc / v, k));
+        }
+      }
+      f += (e.face === 'HE' ? 1 : -1) * (p - atmPsia) * e.areaIn2;
+    }
+    maxF = Math.max(maxF, f);
+    minF = Math.min(minF, f);
+    if (f > 0) degC += stepDeg;
+    else if (f < 0) degT += stepDeg;
+  }
+  const compressionLb = Math.max(0, maxF);
+  const tensionLb = Math.max(0, -minF);
+  return { compressionLb, tensionLb, combinedLb: compressionLb + tensionLb, reversalDeg: Math.min(degC, degT) };
+}
+
+/** Single-cylinder convenience wrapper (inactive end held at suction). */
 export function rodLoadCycle(opts: {
   areas: Areas;
   strokeIn: number;
@@ -248,54 +300,79 @@ export function rodLoadCycle(opts: {
   ceActive: boolean;
   stepDeg?: number;
 }): RodLoadResult {
-  const { areas, strokeIn: S, ps, pd, k, atmPsia, heActive, ceActive } = opts;
-  const step = opts.stepDeg ?? 1;
-  const vcHe = (opts.clearanceHePct / 100) * areas.heIn2 * S;
-  const vcCe = (opts.clearanceCePct / 100) * areas.ceIn2 * S;
-  const vmaxHe = vcHe + areas.heIn2 * S;
-  const vmaxCe = vcCe + areas.ceIn2 * S;
-  let maxF = -Infinity;
-  let minF = Infinity;
-  let degC = 0;
-  let degT = 0;
-  for (let th = 0; th < 360; th += step) {
-    const x = pistonPosition(th, S);
-    const vHe = vcHe + areas.heIn2 * x;
-    const vCe = vcCe + areas.ceIn2 * (S - x);
-    let pHe = ps;
-    let pCe = ps;
-    if (heActive) {
-      pHe = th < 180 ? Math.max(ps, pd * Math.pow(vcHe / vHe, k)) : Math.min(pd, ps * Math.pow(vmaxHe / vHe, k));
-    }
-    if (ceActive) {
-      pCe = th < 180 ? Math.min(pd, ps * Math.pow(vmaxCe / vCe, k)) : Math.max(ps, pd * Math.pow(vcCe / vCe, k));
-    }
-    const f = (pHe - atmPsia) * areas.heIn2 - (pCe - atmPsia) * areas.ceIn2;
-    maxF = Math.max(maxF, f);
-    minF = Math.min(minF, f);
-    if (f > 0) degC += step;
-    else if (f < 0) degT += step;
-  }
-  const compressionLb = Math.max(0, maxF);
-  const tensionLb = Math.max(0, -minF);
+  const { areas, ps, pd } = opts;
+  return rodLoadCycleEnds(
+    [
+      { face: 'HE', areaIn2: areas.heIn2, clearancePct: opts.clearanceHePct, active: opts.heActive, ps, pd, fixedPsia: ps },
+      { face: 'CE', areaIn2: areas.ceIn2, clearancePct: opts.clearanceCePct, active: opts.ceActive, ps, pd, fixedPsia: ps },
+    ],
+    opts.strokeIn,
+    opts.k,
+    opts.atmPsia,
+    opts.stepDeg,
+  );
+}
+
+// ------------------------------------------------------------- tandems
+
+/**
+ * Working areas of a tandem throw (in²). Layout from the crosshead out:
+ *   crosshead ─ piston rod ─ [CE | INBOARD | HE] ─ tandem neck ─ [CE | OUTBOARD | HE]
+ *   inboard CE  = A_in  − A_rod   (frame side, reduced by piston rod)
+ *   inboard HE  = A_in  − A_neck  (faces the neck)
+ *   outboard CE = A_out − A_neck  (faces the neck)
+ *   outboard HE = A_out           (outer head, full bore)
+ */
+export function tandemAreas(inBoreIn: number, outBoreIn: number, rodDiaIn: number, neckDiaIn: number) {
+  const a = (d: number) => (Math.PI / 4) * d * d;
   return {
-    compressionLb,
-    tensionLb,
-    combinedLb: compressionLb + tensionLb,
-    reversalDeg: Math.min(degC, degT),
+    inboard: { heIn2: a(inBoreIn) - a(neckDiaIn), ceIn2: a(inBoreIn) - a(rodDiaIn), rodIn2: a(rodDiaIn) } as Areas,
+    outboard: { heIn2: a(outBoreIn), ceIn2: a(outBoreIn) - a(neckDiaIn), rodIn2: a(neckDiaIn) } as Areas,
   };
 }
 
 // ------------------------------------------------------------- run model
 
 export type Deactivate = 'none' | 'HE' | 'CE';
+/**
+ * Reference for a cylinder end:
+ *   'active' = compressing for its own stage
+ *   'vent'   = vented to atmosphere / distance piece (0 psig)
+ *   's1'..'s3' = held at that stage's suction pressure (e.g. vented back to 1st-stage suction)
+ */
+export type EndMode = 'active' | 'vent' | 's1' | 's2' | 's3';
+
+export interface TandemEnds {
+  inHE: EndMode;
+  inCE: EndMode;
+  outHE: EndMode;
+  outCE: EndMode;
+}
+
+/**
+ * Default tandem end arrangement (ASSUMPTION — typical small-frame HP tandem):
+ *   outboard (HP) cylinder: head end active, neck-side CE referenced to 1st-stage suction
+ *   inboard cylinder:       crank end active, neck-side HE referenced to 1st-stage suction
+ * The two active ends compress on opposite strokes, which keeps peak rod load
+ * down and gives load reversal. Change per unit once the real layout is known.
+ */
+export const DEFAULT_TANDEM_ENDS: TandemEnds = { inHE: 's1', inCE: 'active', outHE: 'active', outCE: 's1' };
 
 export interface ThrowConfig {
+  /** single cylinder (default) or tandem (inboard + outboard on one rod) */
+  kind?: 'single' | 'tandem';
+  /** single cylinder, or the INBOARD cylinder of a tandem */
   cylinderId: string;
   stage: number; // 1-based
+  /** single only */
   deactivate: Deactivate;
-  /** 0–100 % of the cylinder's head-end pocket volume opened */
+  /** 0–100 % of the head-end pocket opened (single, or outboard of a tandem) */
   pocketOpenPct: number;
+  outCylinderId?: string;
+  outStage?: number;
+  /** tandem neck dia between cylinders, in (ASSUMED = piston rod dia unless known) */
+  neckDiaIn?: number;
+  ends?: TandemEnds;
 }
 
 export interface RunConfig {
@@ -310,7 +387,10 @@ export interface RunConfig {
   suctionPsig: number;
   suctionTempF: number;
   dischargePsig: number;
-  interstageTempF: number;
+  /** Cooler outlet (= next stage suction) temps: [after stg 1, after stg 2] */
+  interstageTempsF: number[];
+  /** legacy single value (older saved runs) */
+  interstageTempF?: number;
   atmPsia: number;
   driverHp: number | null;
   interstageMode: 'equal' | 'balanced';
@@ -326,8 +406,8 @@ export const DEFAULT_CONFIG: RunConfig = {
   rpm: 1800,
   stages: 2,
   throws: [
-    { cylinderId: 'pkg-2.0625', stage: 1, deactivate: 'none', pocketOpenPct: 0 },
-    { cylinderId: 'pkg-1.75', stage: 2, deactivate: 'none', pocketOpenPct: 0 },
+    { kind: 'single', cylinderId: 'pkg-2.0625', stage: 1, deactivate: 'none', pocketOpenPct: 0 },
+    { kind: 'single', cylinderId: 'pkg-1.75', stage: 2, deactivate: 'none', pocketOpenPct: 0 },
   ],
   sg: 0.65,
   k: 1.275,
@@ -336,7 +416,7 @@ export const DEFAULT_CONFIG: RunConfig = {
   suctionPsig: 100,
   suctionTempF: 80,
   dischargePsig: 1200,
-  interstageTempF: 120,
+  interstageTempsF: [120, 120],
   atmPsia: 14.4,
   driverHp: null,
   interstageMode: 'equal',
@@ -347,6 +427,33 @@ export const DEFAULT_CONFIG: RunConfig = {
   minReversalDeg: 15,
 };
 
+/** Preset: PXT 3-stage — 1st stage on throw 1, 2nd (inboard) + 3rd (outboard) tandem on throw 2. */
+export const PRESET_PXT_3STAGE: RunConfig = {
+  ...DEFAULT_CONFIG,
+  frameId: 'PXT',
+  rpm: 1800,
+  stages: 3,
+  interstageMode: 'balanced',
+  dischargePsig: 1500,
+  throws: [
+    { kind: 'single', cylinderId: 'ph-tdm-4.5-s1', stage: 1, deactivate: 'none', pocketOpenPct: 0 },
+    {
+      kind: 'tandem',
+      cylinderId: 'ph-tdm-4.5-in',
+      stage: 2,
+      deactivate: 'none',
+      pocketOpenPct: 0,
+      outCylinderId: 'ph-tdm-2.75-out',
+      outStage: 3,
+      neckDiaIn: 1.125,
+      ends: { ...DEFAULT_TANDEM_ENDS },
+    },
+  ],
+};
+
+/** Stage-slot count a throw layout provides (single = 1, tandem = 2). */
+export const stageSlots = (throws: ThrowConfig[]) => throws.reduce((n, t) => n + (t.kind === 'tandem' ? 2 : 1), 0);
+
 export type FlagLevel = 'red' | 'amber' | 'info';
 export interface Flag {
   level: FlagLevel;
@@ -355,19 +462,32 @@ export interface Flag {
 
 export interface EndResult {
   active: boolean;
+  mode: EndMode;
+  /** pressure the end sits at when not active, psig */
+  refPsig: number | null;
+  areaIn2: number;
   clearancePct: number;
   ve: number;
   displacementCfm: number;
   acfm: number;
 }
 
-export interface ThrowResult {
-  index: number; // 0-based
+export type PartPosition = 'single' | 'inboard' | 'outboard';
+
+export interface PartResult {
+  throwIndex: number;
+  position: PartPosition;
   stage: number;
   cylinder: Cylinder;
-  areas: Areas;
   he: EndResult;
   ce: EndResult;
+}
+
+export interface ThrowResult {
+  index: number; // 0-based
+  kind: 'single' | 'tandem';
+  neckDiaIn: number | null;
+  parts: PartResult[];
   rod: RodLoadResult;
   pctCompression: number | null;
   pctTension: number | null;
@@ -389,7 +509,8 @@ export interface StageResult {
   mmscfd: number;
   ihp: number;
   bhp: number;
-  throws: number[];
+  /** cylinder parts in this stage */
+  parts: PartResult[];
 }
 
 export interface RunResult {
@@ -413,7 +534,7 @@ export function effectiveK(cfg: RunConfig): number {
   return cfg.autoK ? estimateK(cfg.sg) : cfg.k;
 }
 
-/** Cylinder end activity after acting type + deactivation. */
+/** Cylinder end activity after acting type + deactivation (single throws). */
 export function activeEnds(acting: Acting, deactivate: Deactivate) {
   return {
     he: acting !== 'SA-CE' && deactivate !== 'HE',
@@ -421,69 +542,112 @@ export function activeEnds(acting: Acting, deactivate: Deactivate) {
   };
 }
 
+/** Stage suction temperature, °F (stage 1 = suction, later = cooler outlet). */
+export function stageSuctionTempF(cfg: RunConfig, stage: number): number {
+  if (stage <= 1) return cfg.suctionTempF;
+  return cfg.interstageTempsF?.[stage - 2] ?? cfg.interstageTempF ?? 120;
+}
+
+/** Geometry/arrangement of one cylinder on a throw, independent of pressures. */
+interface Part {
+  throwIndex: number;
+  position: PartPosition;
+  stage: number;
+  cylinder: Cylinder;
+  areas: Areas;
+  cHe: number;
+  cCe: number;
+  heMode: EndMode;
+  ceMode: EndMode;
+}
+
+function buildParts(cfg: RunConfig, frame: FrameSpec, lookup: (id: string) => Cylinder | undefined): Part[] {
+  const parts: Part[] = [];
+  const own = (s: number) => `s${Math.min(3, Math.max(1, s))}` as EndMode;
+  const pocketPct = (cyl: Cylinder, area: number, openPct: number) =>
+    (100 * (cyl.pocketMaxIn3 || 0) * (Math.min(100, Math.max(0, openPct)) / 100)) / (area * frame.strokeIn);
+  cfg.throws.forEach((t, i) => {
+    const cyl = lookup(t.cylinderId);
+    if (t.kind === 'tandem') {
+      const out = t.outCylinderId ? lookup(t.outCylinderId) : undefined;
+      if (!cyl || !out) return;
+      const ends = t.ends ?? DEFAULT_TANDEM_ENDS;
+      const ta = tandemAreas(cyl.boreIn, out.boreIn, cyl.rodDiaIn ?? frame.rodDiaIn, t.neckDiaIn ?? frame.rodDiaIn);
+      const outStage = t.outStage ?? t.stage;
+      // a cylinder end the library says can't act falls back to its own stage suction
+      const fix = (m: EndMode, allowed: boolean, s: number): EndMode => (m === 'active' && !allowed ? own(s) : m);
+      parts.push({
+        throwIndex: i,
+        position: 'inboard',
+        stage: t.stage,
+        cylinder: cyl,
+        areas: ta.inboard,
+        cHe: cyl.clearanceHePct,
+        cCe: cyl.clearanceCePct,
+        heMode: fix(ends.inHE, cyl.acting !== 'SA-CE', t.stage),
+        ceMode: fix(ends.inCE, cyl.acting !== 'SA-HE', t.stage),
+      });
+      parts.push({
+        throwIndex: i,
+        position: 'outboard',
+        stage: outStage,
+        cylinder: out,
+        areas: ta.outboard,
+        cHe: out.clearanceHePct + pocketPct(out, ta.outboard.heIn2, t.pocketOpenPct),
+        cCe: out.clearanceCePct,
+        heMode: fix(ends.outHE, out.acting !== 'SA-CE', outStage),
+        ceMode: fix(ends.outCE, out.acting !== 'SA-HE', outStage),
+      });
+    } else {
+      if (!cyl) return;
+      const areas = cylinderAreas(cyl.boreIn, cyl.rodDiaIn ?? frame.rodDiaIn);
+      const act = activeEnds(cyl.acting, t.deactivate);
+      parts.push({
+        throwIndex: i,
+        position: 'single',
+        stage: t.stage,
+        cylinder: cyl,
+        areas,
+        cHe: cyl.clearanceHePct + pocketPct(cyl, areas.heIn2, t.pocketOpenPct),
+        cCe: cyl.clearanceCePct,
+        heMode: act.he ? 'active' : own(t.stage),
+        ceMode: act.ce ? 'active' : own(t.stage),
+      });
+    }
+  });
+  return parts;
+}
+
 interface StageCtx {
   cfg: RunConfig;
   frame: FrameSpec;
   k: number;
-  lookup: (id: string) => Cylinder | undefined;
+  parts: Part[];
 }
 
-/** Compute one stage's thermodynamics and per-throw ends at given flange pressures (psia). */
+/** One stage's thermodynamics + end flows at given flange pressures (psia). Ref pressures filled later. */
 function computeStage(ctx: StageCtx, stage: number, psPsia: number, pdPsia: number) {
-  const { cfg, frame, k, lookup } = ctx;
-  const tsF = stage === 1 ? cfg.suctionTempF : cfg.interstageTempF;
+  const { cfg, frame, k } = ctx;
+  const tsF = stageSuctionTempF(cfg, stage);
   const r = compressionRatio(psPsia, pdPsia);
   const tdF = dischargeTempF(tsF, r, k);
   const zs = zFactor(psPsia, tsF, cfg.sg, cfg.zMethod);
   const zd = zFactor(pdPsia, tdF, cfg.sg, cfg.zMethod);
-  const throwIdx: number[] = [];
-  const throws: ThrowResult[] = [];
   let acfm = 0;
-  cfg.throws.forEach((t, i) => {
-    if (t.stage !== stage) return;
-    const cyl = lookup(t.cylinderId);
-    if (!cyl) return;
-    throwIdx.push(i);
-    const rodDia = cyl.rodDiaIn ?? frame.rodDiaIn;
-    const areas = cylinderAreas(cyl.boreIn, rodDia);
-    const act = activeEnds(cyl.acting, t.deactivate);
-    const pocketVol = (cyl.pocketMaxIn3 || 0) * (Math.min(100, Math.max(0, t.pocketOpenPct)) / 100);
-    const cHe = cyl.clearanceHePct + (100 * pocketVol) / (areas.heIn2 * frame.strokeIn);
-    const cCe = cyl.clearanceCePct;
-    const mkEnd = (active: boolean, area: number, c: number): EndResult => {
-      const pd = endDisplacementCfm(area, frame.strokeIn, cfg.rpm);
+  const parts: PartResult[] = [];
+  for (const p of ctx.parts) {
+    if (p.stage !== stage) continue;
+    const mkEnd = (mode: EndMode, area: number, c: number): EndResult => {
+      const active = mode === 'active';
+      const disp = endDisplacementCfm(area, frame.strokeIn, cfg.rpm);
       const ve = active ? volumetricEfficiency(c, r, k, zs, zd, cfg.lubricated) : 0;
-      return { active, clearancePct: c, ve, displacementCfm: pd, acfm: active ? (pd * ve) / 100 : 0 };
+      return { active, mode, refPsig: null, areaIn2: area, clearancePct: c, ve, displacementCfm: disp, acfm: active ? (disp * ve) / 100 : 0 };
     };
-    const he = mkEnd(act.he, areas.heIn2, cHe);
-    const ce = mkEnd(act.ce, areas.ceIn2, cCe);
+    const he = mkEnd(p.heMode, p.areas.heIn2, p.cHe);
+    const ce = mkEnd(p.ceMode, p.areas.ceIn2, p.cCe);
     acfm += he.acfm + ce.acfm;
-    const rod = rodLoadCycle({
-      areas,
-      strokeIn: frame.strokeIn,
-      clearanceHePct: cHe,
-      clearanceCePct: cCe,
-      ps: psPsia,
-      pd: pdPsia,
-      k,
-      atmPsia: cfg.atmPsia,
-      heActive: act.he,
-      ceActive: act.ce,
-    });
-    const pct = (v: number, lim: number | null) => (lim ? (100 * v) / lim : null);
-    throws.push({
-      index: i,
-      stage,
-      cylinder: cyl,
-      areas,
-      he,
-      ce,
-      rod,
-      pctCompression: pct(rod.compressionLb, frame.rodLoadCompressionLb),
-      pctTension: pct(rod.tensionLb, frame.rodLoadTensionLb),
-      pctCombined: pct(rod.combinedLb, frame.rodLoadCombinedLb),
-    });
-  });
+    parts.push({ throwIndex: p.throwIndex, position: p.position, stage, cylinder: p.cylinder, he, ce });
+  }
   const mmscfd = acfmToMMSCFD(acfm, psPsia, tsF, zs);
   const ihp = isentropicHp(psPsia, acfm, r, k, zs, zd);
   const st: StageResult = {
@@ -501,9 +665,9 @@ function computeStage(ctx: StageCtx, stage: number, psPsia: number, pdPsia: numb
     mmscfd,
     ihp,
     bhp: brakeHp(ihp, cfg.compEff, cfg.mechEff),
-    throws: throwIdx,
+    parts,
   };
-  return { st, throws };
+  return st;
 }
 
 /** Equal compression ratio per stage → array of n+1 absolute pressures. */
@@ -584,26 +748,68 @@ export function runPerformance(
   const pd = toPsia(cfg.dischargePsig, cfg.atmPsia);
   if (!(ps > 0) || !(pd > ps)) return { ...empty, error: 'Discharge pressure must be above suction pressure.' };
   if (!(cfg.rpm > 0)) return { ...empty, error: 'RPM must be above 0.' };
+  const parts = buildParts(cfg, frame, lookup);
   for (let s = 1; s <= cfg.stages; s++) {
-    if (!cfg.throws.some((t) => t.stage === s && lookup(t.cylinderId)))
-      return { ...empty, error: `Stage ${s} has no cylinder assigned.` };
+    if (!parts.some((p) => p.stage === s)) return { ...empty, error: `Stage ${s} has no cylinder assigned.` };
   }
-  const ctx: StageCtx = { cfg, frame, k, lookup };
+  const orphan = parts.find((p) => p.stage > cfg.stages);
+  if (orphan) return { ...empty, error: `Throw ${orphan.throwIndex + 1} has a cylinder on stage ${orphan.stage}, but only ${cfg.stages} stage(s) set.` };
+  const ctx: StageCtx = { cfg, frame, k, parts };
   let p = equalRatioPressures(ps, pd, cfg.stages);
   let iterations = 0;
   if (cfg.interstageMode === 'balanced' && cfg.stages > 1) {
-    const sol = balancePressures((s, a, b) => computeStage(ctx, s, a, b).st.mmscfd, p);
+    const sol = balancePressures((s, a, b) => computeStage(ctx, s, a, b).mmscfd, p);
     p = sol.p;
     iterations = sol.iterations;
   }
   const stages: StageResult[] = [];
-  const throws: ThrowResult[] = [];
-  for (let s = 1; s <= cfg.stages; s++) {
-    const { st, throws: th } = computeStage(ctx, s, p[s - 1], p[s]);
-    stages.push(st);
-    throws.push(...th);
+  for (let s = 1; s <= cfg.stages; s++) stages.push(computeStage(ctx, s, p[s - 1], p[s]));
+
+  // reference pressure (psia) for a non-active end
+  const refPsia = (m: EndMode): number => {
+    if (m === 'vent') return cfg.atmPsia;
+    const n = Math.min(cfg.stages, Number(m.slice(1)) || 1);
+    return p[n - 1];
+  };
+  const allParts = stages.flatMap((s) => s.parts);
+  for (const pr of allParts) {
+    for (const e of [pr.he, pr.ce]) if (!e.active) e.refPsig = toPsig(refPsia(e.mode), cfg.atmPsia);
   }
-  throws.sort((a, b) => a.index - b.index);
+
+  // ---- rod loads per throw (sum of every face on the rod)
+  const throws: ThrowResult[] = [];
+  cfg.throws.forEach((t, i) => {
+    const tp = allParts.filter((x) => x.throwIndex === i).sort((a, b) => (a.position === 'outboard' ? 1 : 0) - (b.position === 'outboard' ? 1 : 0));
+    if (!tp.length) return;
+    const ends: CycleEnd[] = [];
+    for (const pr of tp) {
+      const st = stages[pr.stage - 1];
+      for (const [face, e] of [['HE', pr.he], ['CE', pr.ce]] as const) {
+        ends.push({
+          face,
+          areaIn2: e.areaIn2,
+          clearancePct: e.clearancePct,
+          active: e.active,
+          ps: st.psPsia,
+          pd: st.pdPsia,
+          fixedPsia: e.active ? st.psPsia : refPsia(e.mode),
+        });
+      }
+    }
+    const rod = rodLoadCycleEnds(ends, frame.strokeIn, k, cfg.atmPsia);
+    const pct = (v: number, lim: number | null) => (lim ? (100 * v) / lim : null);
+    throws.push({
+      index: i,
+      kind: t.kind === 'tandem' ? 'tandem' : 'single',
+      neckDiaIn: t.kind === 'tandem' ? (t.neckDiaIn ?? frame.rodDiaIn) : null,
+      parts: tp,
+      rod,
+      pctCompression: pct(rod.compressionLb, frame.rodLoadCompressionLb),
+      pctTension: pct(rod.tensionLb, frame.rodLoadTensionLb),
+      pctCombined: pct(rod.combinedLb, frame.rodLoadCombinedLb),
+    });
+  });
+
   const flows = stages.map((s) => s.mmscfd);
   const mmscfd = Math.min(...flows);
   const bhp = stages.reduce((a, s) => a + s.bhp, 0);
@@ -629,15 +835,23 @@ export function runPerformance(
     else if (s.tdF > cfg.alarmDischargeTempF - 25)
       flags.push({ level: 'amber', msg: `Stage ${s.stage} discharge temp ${fmt(s.tdF)}°F is within 25°F of the alarm.` });
     if (s.ratio > 4.5) flags.push({ level: 'amber', msg: `Stage ${s.stage} ratio ${fmt(s.ratio, 2)} is high for one stage.` });
-    if (s.mmscfd <= 0) flags.push({ level: 'red', msg: `Stage ${s.stage} moves no gas (VE ≤ 0). Ratio too high for the clearance.` });
+    if (s.mmscfd <= 0) flags.push({ level: 'red', msg: `Stage ${s.stage} moves no gas (VE ≤ 0 or no active ends).` });
+  }
+  const posLabel = (pr: PartResult) => (pr.position === 'single' ? '' : pr.position === 'inboard' ? ' inboard' : ' outboard');
+  for (const pr of allParts) {
+    const tag = `Throw ${pr.throwIndex + 1}${posLabel(pr)} (stg ${pr.stage}, ${pr.cylinder.boreIn}")`;
+    const st = stages[pr.stage - 1];
+    // highest pressure the cylinder sees: its discharge, or a referenced pressure on an inactive end
+    const maxP = Math.max(st.pdPsig, pr.he.refPsig ?? -Infinity, pr.ce.refPsig ?? -Infinity);
+    if (maxP > pr.cylinder.mawpPsig)
+      flags.push({ level: 'red', msg: `${tag}: ${fmt(maxP)} psig exceeds cylinder MAWP ${fmt(pr.cylinder.mawpPsig)} psig.` });
+    else if (maxP > 0.9 * pr.cylinder.mawpPsig)
+      flags.push({ level: 'amber', msg: `${tag}: pressure is over 90% of MAWP — check relief valve margin.` });
+    if (!pr.he.active && !pr.ce.active) flags.push({ level: 'amber', msg: `${tag}: both ends inactive — cylinder does no work.` });
+    if (pr.cylinder.placeholder) flags.push({ level: 'info', msg: `${tag}: placeholder cylinder data — verify with CiP data.` });
   }
   for (const t of throws) {
-    const tag = `Throw ${t.index + 1} (stg ${t.stage}, ${t.cylinder.boreIn}")`;
-    const st = stages[t.stage - 1];
-    if (st.pdPsig > t.cylinder.mawpPsig)
-      flags.push({ level: 'red', msg: `${tag}: discharge ${fmt(st.pdPsig)} psig exceeds cylinder MAWP ${fmt(t.cylinder.mawpPsig)} psig.` });
-    else if (st.pdPsig > 0.9 * t.cylinder.mawpPsig)
-      flags.push({ level: 'amber', msg: `${tag}: discharge is over 90% of MAWP — check relief valve margin.` });
+    const tag = `Throw ${t.index + 1}${t.kind === 'tandem' ? ' (tandem)' : ''}`;
     const chk = (label: string, v: number, lim: number | null, pct: number | null) => {
       if (lim == null || pct == null) return;
       if (pct > 100) flags.push({ level: 'red', msg: `${tag}: ${label} rod load ${fmt(v)} lb exceeds ${fmt(lim)} lb (${fmt(pct)}%).` });
@@ -649,7 +863,8 @@ export function runPerformance(
     if (t.rod.reversalDeg <= 0) flags.push({ level: 'red', msg: `${tag}: no gas rod load reversal.` });
     else if (t.rod.reversalDeg < cfg.minReversalDeg)
       flags.push({ level: 'red', msg: `${tag}: gas load reversal only ${fmt(t.rod.reversalDeg)}° (min ${cfg.minReversalDeg}°).` });
-    if (t.cylinder.placeholder) flags.push({ level: 'info', msg: `${tag}: placeholder cylinder data — verify with CiP data.` });
+    if (t.kind === 'tandem')
+      flags.push({ level: 'info', msg: `${tag}: tandem neck dia ${t.neckDiaIn}" and end arrangement are assumptions — confirm with the unit's cylinder layout.` });
   }
   if (frame.rodLoadTensionLb == null) flags.push({ level: 'info', msg: `${frame.id}: no published tension/combined rod load limit; only compression checked.` });
   if (cfg.stages > 1 && cfg.interstageMode === 'equal') {
